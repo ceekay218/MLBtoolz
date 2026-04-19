@@ -542,7 +542,7 @@ def build_top_streaks(game_stats):
     if temp > 0:
         streaks.append((temp, start, dates[-1]))
 
-    return sorted(streaks, key=lambda x: x[0], reverse=True)[:10]
+    return sorted(streaks, key=lambda x: (x[0], x[2]), reverse=True)[:20]
 
 def build_standard_game_stats(df, stat_choice, line, direction):
     df = df.copy()
@@ -802,7 +802,7 @@ def render_manual_player(player, r, line, direction):
     with st.expander("View Details"):
         current_color = "green" if abs(signed_streak) >= 3 else "white"
         st.markdown(
-            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
+            f"### 🔥 Top 20 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
             unsafe_allow_html=True
         )
 
@@ -885,7 +885,7 @@ def render_fantasy_player(player, r, line, direction):
     with st.expander("View Details"):
         current_color = "green" if abs(signed_streak) >= 3 else "white"
         st.markdown(
-            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
+            f"### 🔥 Top 20 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
             unsafe_allow_html=True
         )
 
@@ -1033,7 +1033,7 @@ def render_scan_player_card(player_name, player_id, team, matchup, book_title, q
         st.markdown(f"<div style='color:#cccccc; margin-top:-8px;'>{joined_title}</div>", unsafe_allow_html=True)
 
     with st.expander("View Details"):
-        st.markdown("### 🔥 Top 10 Streaks", unsafe_allow_html=True)
+        st.markdown("### 🔥 Top 20 Streaks", unsafe_allow_html=True)
 
         for q in qualified_stats:
             label_txt = f"{q['Fantasy Book']} Fantasy Points" if q["Mode"] == "fantasy" else q["Stat"]
