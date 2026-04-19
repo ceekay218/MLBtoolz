@@ -13,7 +13,25 @@ from concurrent.futures import ThreadPoolExecutor
 st.set_page_config(layout="wide")
 st.title("🔥 MLB Streak + Regression Analyzer")
 
-ODDS_API_KEY = "46860b5ed2ba75acaa783a1bb8253723"
+
+def get_odds_api_key():
+    try:
+        if "ODDS_API_KEY" in st.secrets:
+            return st.secrets["ODDS_API_KEY"]
+    except Exception:
+        pass
+
+    try:
+        odds_block = st.secrets.get("odds_api", {})
+        if isinstance(odds_block, dict) and odds_block.get("api_key"):
+            return odds_block["api_key"]
+    except Exception:
+        pass
+
+    return None
+
+
+ODDS_API_KEY = get_odds_api_key()
 TODAY = date.today().strftime("%Y-%m-%d")
 
 BOOKMAKER_MAP = {
@@ -197,6 +215,7 @@ def normalize_name(name):
     x = " ".join(x.split())
     return x
 
+
 def get_player_id(name):
     try:
         parts = name.split(" ")
@@ -208,13 +227,15 @@ def get_player_id(name):
         if df.empty:
             return None
         return int(df.iloc[0]["key_mlbam"])
-    except:
+    except Exception:
         return None
+
 
 def get_headshot(player_id):
     if not player_id:
         return "https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/missing/headshot/67/current.png"
     return f"https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/{int(player_id)}/headshot/67/current.png"
+
 
 def innings_string_to_float(ip_value):
     try:
@@ -231,8 +252,9 @@ def innings_string_to_float(ip_value):
         if frac == 2:
             return whole + (2 / 3)
         return float(whole)
-    except:
+    except Exception:
         return 0.0
+
 
 def streak_rating(current, past):
     if not past:
@@ -247,6 +269,7 @@ def streak_rating(current, past):
     elif prob < 0.65:
         return "⚪ Coin Flip ⚖️", prob
     return "🟢 Strong ✅", prob
+
 
 def build_result_streaks(game_stats):
     streak = 0
@@ -276,6 +299,46 @@ def build_result_streaks(game_stats):
         past.append(temp)
 
     return game_stats, current, past
+
+
+def clear_daily_scan_view(bookmaker_key=None):
+    targets = [bookmaker_key] if bookmaker_key else list(BOOKMAKER_MAP.values())
+    for key in targets:
+        st.session_state.pop(f"daily_scan_view_{key}", None)
+
+
+def save_daily_scan_view(bookmaker_key, payload):
+    st.session_state[f"daily_scan_view_{bookmaker_key}"] = payload
+
+
+def get_daily_scan_view(bookmaker_key):
+    return st.session_state.get(f"daily_scan_view_{bookmaker_key}")
+
+
+def reset_daily_scan_for_book_switch(new_bookmaker_key):
+    previous_book = st.session_state.get("daily_scan_active_bookmaker")
+    if previous_book != new_bookmaker_key:
+        st.session_state["daily_scan_active_bookmaker"] = new_bookmaker_key
+        st.session_state["daily_scan_last_action"] = None
+
+
+def clear_refreshable_caches():
+    try:
+        odds_get_today_events.clear()
+    except Exception:
+        pass
+    try:
+        get_today_games.clear()
+    except Exception:
+        pass
+    try:
+        get_game_boxscore.clear()
+    except Exception:
+        pass
+    try:
+        get_today_starting_lineups.clear()
+    except Exception:
+        pass
 
 # =========================================================
 # DATA LOADERS
@@ -322,7 +385,7 @@ def load_hitter_data(player_id):
                     "ab": int(stat.get("atBats", 0))
                 })
             return rows
-        except:
+        except Exception:
             return []
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -339,6 +402,7 @@ def load_hitter_data(player_id):
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["game_date"])
     return df.sort_values("game_date", ascending=False)
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def load_pitcher_data(player_id):
@@ -369,7 +433,7 @@ def load_pitcher_data(player_id):
                     "ip_display": ip_string,
                 })
             return rows
-        except:
+        except Exception:
             return []
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -404,6 +468,7 @@ def get_stat(row, stat_choice):
     key = stat_map.get(stat_choice, stat_choice.lower())
     return row.get(key, 0)
 
+
 def get_hitter_fantasy_score(row, book_name):
     s = FANTASY_SCORING[book_name]["Hitter"]
     return (
@@ -417,6 +482,7 @@ def get_hitter_fantasy_score(row, book_name):
         + row.get("hbp", 0) * s["hbp"]
         + row.get("stolen_bases", 0) * s["stolen_base"]
     )
+
 
 def get_pitcher_fantasy_score(row, book_name):
     s = FANTASY_SCORING[book_name]["Pitcher"]
@@ -436,6 +502,7 @@ def get_pitcher_fantasy_score(row, book_name):
         + row.get("earned_runs", 0) * s["earned_run"]
     )
 
+
 def compute_current_streak(series_bool):
     current = 0
     for v in series_bool:
@@ -444,6 +511,7 @@ def compute_current_streak(series_bool):
         else:
             break
     return current
+
 
 def build_top_streaks(game_stats):
     gs = game_stats.sort_values("game_date")
@@ -469,6 +537,7 @@ def build_top_streaks(game_stats):
 
     return sorted(streaks, key=lambda x: x[0], reverse=True)[:10]
 
+
 def build_standard_game_stats(df, stat_choice, line, direction):
     df = df.copy()
     df["stat"] = df.apply(lambda row: get_stat(row, stat_choice), axis=1)
@@ -483,6 +552,7 @@ def build_standard_game_stats(df, stat_choice, line, direction):
     game_stats, current, past = build_result_streaks(game_stats)
     label, prob = streak_rating(current, past)
     return game_stats, current, past, label, prob
+
 
 def build_fantasy_game_stats(df, line, direction, book_name, role):
     df = df.copy()
@@ -504,6 +574,7 @@ def build_fantasy_game_stats(df, line, direction, book_name, role):
     game_stats, current, past = build_result_streaks(game_stats)
     label, prob = streak_rating(current, past)
     return game_stats, current, past, label, prob
+
 
 def get_standard_streaks_for_line(player_name, stat_choice, line):
     player_id = get_player_id(player_name)
@@ -536,6 +607,7 @@ def get_standard_streaks_for_line(player_name, stat_choice, line):
         "under_current": under_current,
         "game_stats": gs
     }
+
 
 def get_fantasy_streaks_for_line(player_name, line, book_name, role="Hitter"):
     player_id = get_player_id(player_name)
@@ -612,6 +684,7 @@ def process_player(player, stat_choice, line, direction):
         "no_data": False
     }
 
+
 def process_fantasy_player(player, line, direction, book_name, role):
     player_id = get_player_id(player)
 
@@ -675,6 +748,7 @@ def render_not_found(player, error_tag):
             """,
             unsafe_allow_html=True
         )
+
 
 def render_manual_player(player, r, line, direction):
     if r.get("not_found"):
@@ -749,6 +823,7 @@ def render_manual_player(player, r, line, direction):
         )
 
         st.altair_chart(bar + zero_text, use_container_width=True)
+
 
 def render_fantasy_player(player, r, line, direction):
     if r.get("not_found"):
@@ -831,6 +906,7 @@ def render_fantasy_player(player, r, line, direction):
 
         st.altair_chart(bar + zero_text, use_container_width=True)
 
+
 def build_scan_display_game_log(base_df, qualified_stats):
     base_sorted = base_df.sort_values("game_date", ascending=False).reset_index(drop=True)
     display = pd.DataFrame({"game_date": base_sorted["game_date"]})
@@ -876,6 +952,7 @@ def build_scan_display_game_log(base_df, qualified_stats):
 
     return display
 
+
 def build_scan_top_streaks(base_df, q):
     df = base_df.copy()
 
@@ -901,6 +978,7 @@ def build_scan_top_streaks(base_df, q):
             break
 
     return df, current, build_top_streaks(df)
+
 
 def render_scan_player_card(player_name, player_id, team, matchup, book_title, qualified_stats, base_df):
     img = get_headshot(player_id)
@@ -1001,16 +1079,18 @@ def get_today_games():
         if not games:
             return []
         return games[0].get("games", [])
-    except:
+    except Exception:
         return []
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
 def get_game_boxscore(game_pk):
     url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
     try:
         return requests.get(url, timeout=15).json()
-    except:
+    except Exception:
         return {}
+
 
 def parse_lineup_players(boxscore_json):
     starters = []
@@ -1041,6 +1121,7 @@ def parse_lineup_players(boxscore_json):
                 })
 
     return starters
+
 
 def get_today_starting_lineups():
     games = get_today_games()
@@ -1081,6 +1162,7 @@ def get_cached_props(bookmaker_key, scan_date):
     """
     return pd.read_sql_query(q, conn, params=(scan_date, bookmaker_key))
 
+
 def get_cache_meta(bookmaker_key, scan_date):
     cursor.execute("""
         SELECT refreshed_at FROM props_cache_meta
@@ -1089,10 +1171,12 @@ def get_cache_meta(bookmaker_key, scan_date):
     row = cursor.fetchone()
     return row[0] if row else None
 
+
 def clear_props_cache(bookmaker_key, scan_date):
     cursor.execute("DELETE FROM props_cache WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM props_cache_meta WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     conn.commit()
+
 
 def save_props_cache(bookmaker_key, scan_date, props_rows):
     clear_props_cache(bookmaker_key, scan_date)
@@ -1121,8 +1205,12 @@ def save_props_cache(bookmaker_key, scan_date, props_rows):
 
     conn.commit()
 
+
 @st.cache_data(show_spinner=False, ttl=60 * 5)
 def odds_get_today_events():
+    if not ODDS_API_KEY:
+        return [], {}
+
     url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -1140,8 +1228,9 @@ def odds_get_today_events():
             "x-requests-last": r.headers.get("x-requests-last", "")
         }
         return r.json(), headers
-    except:
+    except Exception:
         return [], {}
+
 
 def parse_event_prop_response(event_json, event_id):
     rows = []
@@ -1184,7 +1273,11 @@ def parse_event_prop_response(event_json, event_id):
             rows.extend(temp.values())
     return rows
 
+
 def fetch_props_from_odds_api(bookmaker_key):
+    if not ODDS_API_KEY:
+        return [], {}
+
     events, usage_headers = odds_get_today_events()
     if not events:
         return [], usage_headers
@@ -1217,14 +1310,17 @@ def fetch_props_from_odds_api(bookmaker_key):
                 "x-requests-last": r.headers.get("x-requests-last", last_headers.get("x-requests-last", "")),
             }
             all_rows.extend(parse_event_prop_response(r.json(), event_id))
-        except:
+        except Exception:
             continue
 
     return all_rows, last_headers
 
+
 def get_props_for_book(bookmaker_key, force_refresh=False):
     if force_refresh:
         clear_props_cache(bookmaker_key, TODAY)
+        clear_daily_scan_view(bookmaker_key)
+        clear_refreshable_caches()
 
     cached = get_cached_props(bookmaker_key, TODAY)
     if not cached.empty and not force_refresh:
@@ -1238,15 +1334,18 @@ def get_props_for_book(bookmaker_key, force_refresh=False):
 
     return pd.DataFrame(), False, None, usage_headers
 
+
 def market_key_to_stat(market_key):
     reverse = {v: k for k, v in SUPPORTED_PROP_MARKETS.items()}
     return reverse.get(market_key)
+
 
 def clear_scan_results_cache(bookmaker_key, scan_date):
     cursor.execute("DELETE FROM scan_results_players WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM scan_results_stats WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM scan_results_meta WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     conn.commit()
+
 
 def save_scan_results(bookmaker_key, scan_date, refreshed_at, display_players):
     clear_scan_results_cache(bookmaker_key, scan_date)
@@ -1293,6 +1392,7 @@ def save_scan_results(bookmaker_key, scan_date, refreshed_at, display_players):
     """, (scan_date, bookmaker_key, refreshed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(display_players)))
 
     conn.commit()
+
 
 def get_saved_scan_results(bookmaker_key, scan_date):
     players_df = pd.read_sql_query("""
@@ -1458,52 +1558,187 @@ with tab3:
     else:
         book_title = selected[0]
         bookmaker_key = BOOKMAKER_MAP[book_title]
+        reset_daily_scan_for_book_switch(bookmaker_key)
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            run_scan = st.button("Pull Today's Starting Players + Scan Props", key="run_daily_scan")
-        with col_b:
-            show_last_scan = st.button("Show Last Scan", key="show_last_scan")
-        with col_c:
-            refresh_scan = st.button("Refresh Saved Lines From Sportsbook", key="refresh_daily_scan")
+        if not ODDS_API_KEY:
+            st.error("Odds API key not found in Streamlit secrets. Add ODDS_API_KEY to your app secrets before running the daily props scan.")
+            st.code('ODDS_API_KEY = "your_key_here"')
+        else:
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                run_scan = st.button("Pull Today's Starting Players + Scan Props", key="run_daily_scan")
+            with col_b:
+                show_last_scan = st.button("Show Last Scan", key="show_last_scan")
+            with col_c:
+                refresh_scan = st.button("Refresh Saved Lines From Sportsbook", key="refresh_daily_scan")
 
-        if run_scan or show_last_scan or refresh_scan:
-            force_refresh = bool(refresh_scan)
-            cache_only = bool(show_last_scan)
-            display_players = []
-            usage_headers = {}
-            refreshed_at = None
+            display_state = get_daily_scan_view(bookmaker_key)
 
-            if cache_only:
-                with st.spinner("Loading last saved scan..."):
-                    starters_df = get_today_starting_lineups()
-                    display_players, refreshed_at, saved_count = get_saved_scan_results(bookmaker_key, TODAY)
+            if run_scan or show_last_scan or refresh_scan:
+                force_refresh = bool(refresh_scan)
+                cache_only = bool(show_last_scan)
+                display_players = []
+                usage_headers = {}
+                refreshed_at = None
+                starters_count = None
+                source_text = None
+                warning_text = None
+                info_text = None
 
-                if starters_df.empty:
-                    st.warning("No starting lineups were found from MLB yet.")
+                if cache_only:
+                    with st.spinner("Loading last saved scan..."):
+                        starters_df = get_today_starting_lineups()
+                        display_players, refreshed_at, saved_count = get_saved_scan_results(bookmaker_key, TODAY)
+
+                    starters_count = len(starters_df)
+                    if refreshed_at and not display_players and saved_count == 0:
+                        info_text = "Last saved scan found no starting players with a 3+ streak against the current lines."
+                    elif not refreshed_at:
+                        warning_text = "No saved scan found for today yet. Run a fresh scan first."
+
+                    source_text = f"Using last saved scan. Last saved update: {refreshed_at}" if refreshed_at else None
+
                 else:
-                    st.write(f"Starting lineup players found: **{len(starters_df)}**")
+                    with st.spinner("Loading today's starters and prop lines..."):
+                        starters_df = get_today_starting_lineups()
+                        props_df, from_cache, refreshed_at, usage_headers = get_props_for_book(
+                            bookmaker_key,
+                            force_refresh=force_refresh
+                        )
 
-                if refreshed_at:
-                    st.caption(f"Using last saved scan. Last saved update: {refreshed_at}")
-                else:
-                    st.warning("No saved scan found for today yet. Run a fresh scan first.")
+                    starters_count = len(starters_df)
 
-                if refreshed_at and not display_players and saved_count == 0:
-                    st.info("Last saved scan found no starting players with a 3+ streak against the current lines.")
+                    if props_df.empty:
+                        warning_text = "No props came back from the sportsbook/API for today."
+                        save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
+                    else:
+                        source_origin = "saved cache" if from_cache else "fresh sportsbook request"
+                        source_text = f"Using {source_origin}. Last saved update: {refreshed_at}" if refreshed_at else f"Using {source_origin}."
 
-            else:
-                with st.spinner("Loading today's starters and prop lines..."):
-                    starters_df = get_today_starting_lineups()
-                    props_df, from_cache, refreshed_at, usage_headers = get_props_for_book(
-                        bookmaker_key,
-                        force_refresh=force_refresh
-                    )
+                        props_df["normalized_name"] = props_df["player_name"].apply(normalize_name)
 
-                if starters_df.empty:
-                    st.warning("No starting lineups were found from MLB yet.")
-                else:
-                    st.write(f"Starting lineup players found: **{len(starters_df)}**")
+                        if starters_df.empty:
+                            merged = props_df.iloc[0:0].copy()
+                        else:
+                            merged = props_df.merge(
+                                starters_df[["player_name", "normalized_name", "team", "position", "matchup"]],
+                                on="normalized_name",
+                                how="inner",
+                                suffixes=("_prop", "_starter")
+                            )
+
+                        if merged.empty:
+                            warning_text = "No sportsbook props matched the currently posted starting lineups."
+                            save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
+                        else:
+                            merged = merged.drop_duplicates(subset=["normalized_name", "market_key", "line"]).copy()
+
+                            player_groups = {}
+                            prog = st.progress(0)
+                            total = len(merged)
+
+                            for idx, row in enumerate(merged.itertuples(index=False), start=1):
+                                stat_choice = market_key_to_stat(row.market_key)
+                                if not stat_choice:
+                                    prog.progress(min(idx / total, 1.0))
+                                    continue
+
+                                player_key = normalize_name(row.player_name_starter)
+
+                                if player_key not in player_groups:
+                                    player_groups[player_key] = {
+                                        "Player": row.player_name_starter,
+                                        "Team": row.team,
+                                        "Matchup": row.matchup,
+                                        "Book": book_title,
+                                        "Player ID": None,
+                                        "Error": "",
+                                        "Qualified Stats": []
+                                    }
+
+                                if stat_choice == "Fantasy Points":
+                                    streak_data = get_fantasy_streaks_for_line(
+                                        player_name=row.player_name_starter,
+                                        line=float(row.line),
+                                        book_name=book_title,
+                                        role="Hitter"
+                                    )
+                                else:
+                                    streak_data = get_standard_streaks_for_line(
+                                        player_name=row.player_name_starter,
+                                        stat_choice=stat_choice,
+                                        line=float(row.line)
+                                    )
+
+                                if streak_data and streak_data.get("not_found"):
+                                    player_groups[player_key]["Error"] = SPORTSBOOK_ERROR_TAG
+                                    player_groups[player_key]["Player ID"] = None
+
+                                elif streak_data:
+                                    player_groups[player_key]["Player ID"] = streak_data["player_id"]
+                                    over_s = streak_data["over_current"]
+                                    under_s = streak_data["under_current"]
+
+                                    if over_s >= 3:
+                                        player_groups[player_key]["Qualified Stats"].append({
+                                            "Stat": stat_choice,
+                                            "Line": float(row.line),
+                                            "Direction": "Over",
+                                            "Current": over_s,
+                                            "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
+                                            "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
+                                        })
+
+                                    if under_s >= 3:
+                                        player_groups[player_key]["Qualified Stats"].append({
+                                            "Stat": stat_choice,
+                                            "Line": float(row.line),
+                                            "Direction": "Under",
+                                            "Current": under_s,
+                                            "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
+                                            "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
+                                        })
+
+                                prog.progress(min(idx / total, 1.0))
+
+                            prog.empty()
+
+                            for _, pdata in player_groups.items():
+                                if pdata["Error"] or len(pdata["Qualified Stats"]) > 0:
+                                    display_players.append(pdata)
+
+                            save_scan_results(bookmaker_key, TODAY, refreshed_at, display_players)
+
+                            if not display_players:
+                                info_text = "No starting players had an over or under streak of 3+ against the current line."
+
+                display_state = {
+                    "display_players": display_players,
+                    "usage_headers": usage_headers,
+                    "refreshed_at": refreshed_at,
+                    "starters_count": starters_count,
+                    "source_text": source_text,
+                    "warning_text": warning_text,
+                    "info_text": info_text,
+                    "book_title": book_title,
+                    "bookmaker_key": bookmaker_key,
+                }
+                save_daily_scan_view(bookmaker_key, display_state)
+
+            if display_state:
+                display_players = display_state.get("display_players", [])
+                usage_headers = display_state.get("usage_headers", {})
+                refreshed_at = display_state.get("refreshed_at")
+                starters_count = display_state.get("starters_count")
+                source_text = display_state.get("source_text")
+                warning_text = display_state.get("warning_text")
+                info_text = display_state.get("info_text")
+
+                if starters_count is not None:
+                    if starters_count == 0:
+                        st.warning("No starting lineups were found from MLB yet.")
+                    else:
+                        st.write(f"Starting lineup players found: **{starters_count}**")
 
                 if usage_headers:
                     used = usage_headers.get("x-requests-used", "")
@@ -1511,165 +1746,68 @@ with tab3:
                     last = usage_headers.get("x-requests-last", "")
                     st.caption(f"Odds API usage — Used: {used} | Remaining: {remaining} | Last request cost: {last}")
 
-                if props_df.empty:
-                    st.warning("No props came back from the sportsbook/API for today.")
-                else:
-                    source_txt = "saved cache" if from_cache else "fresh sportsbook request"
-                    meta_txt = f"Last saved update: {refreshed_at}" if refreshed_at else "No saved timestamp yet"
-                    st.caption(f"Using {source_txt}. {meta_txt}")
+                if source_text:
+                    st.caption(source_text)
+                if warning_text:
+                    st.warning(warning_text)
+                if info_text:
+                    st.info(info_text)
 
-                    props_df["normalized_name"] = props_df["player_name"].apply(normalize_name)
+                if display_players:
+                    summary_rows = []
+                    for pdata in display_players:
+                        if pdata["Error"]:
+                            summary_rows.append({
+                                "Player": pdata["Player"],
+                                "Team": pdata["Team"],
+                                "Matchup": pdata["Matchup"],
+                                "Book": pdata["Book"],
+                                "Qualified Stats Found": "N/A",
+                                "Error": pdata["Error"]
+                            })
+                        else:
+                            summary_rows.append({
+                                "Player": pdata["Player"],
+                                "Team": pdata["Team"],
+                                "Matchup": pdata["Matchup"],
+                                "Book": pdata["Book"],
+                                "Qualified Stats Found": len(pdata["Qualified Stats"]),
+                                "Error": ""
+                            })
 
-                    if starters_df.empty:
-                        merged = props_df.iloc[0:0].copy()
-                    else:
-                        merged = props_df.merge(
-                            starters_df[["player_name", "normalized_name", "team", "position", "matchup"]],
-                            on="normalized_name",
-                            how="inner",
-                            suffixes=("_prop", "_starter")
-                        )
+                    summary_df = pd.DataFrame(summary_rows).sort_values(
+                        by=["Qualified Stats Found", "Player"],
+                        ascending=[False, True]
+                    ).reset_index(drop=True)
 
-                    if merged.empty:
-                        st.warning("No sportsbook props matched the currently posted starting lineups.")
-                        save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
-                    else:
-                        merged = merged.drop_duplicates(subset=["normalized_name", "market_key", "line"]).copy()
+                    st.markdown(f"## ✅ Players with at least one 3+ streak vs {book_title} lines")
+                    st.dataframe(summary_df, use_container_width=True)
 
-                        player_groups = {}
-                        prog = st.progress(0)
-                        total = len(merged)
+                    st.markdown("## Player Cards")
+                    for pdata in display_players:
+                        if pdata["Error"]:
+                            render_not_found(pdata["Player"], pdata["Error"])
+                            st.markdown(
+                                f"<div style='margin-top:4px; color:#cccccc;'>{pdata['Team']} • {pdata['Matchup']} • {pdata['Book']}</div>",
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            player_id = pdata["Player ID"]
+                            base_df = load_hitter_data(player_id)
 
-                        for idx, row in enumerate(merged.itertuples(index=False), start=1):
-                            stat_choice = market_key_to_stat(row.market_key)
-                            if not stat_choice:
-                                prog.progress(min(idx / total, 1.0))
+                            if base_df.empty:
+                                st.warning(f"{pdata['Player']} found, but no game log data was returned.")
                                 continue
 
-                            player_key = normalize_name(row.player_name_starter)
-
-                            if player_key not in player_groups:
-                                player_groups[player_key] = {
-                                    "Player": row.player_name_starter,
-                                    "Team": row.team,
-                                    "Matchup": row.matchup,
-                                    "Book": book_title,
-                                    "Player ID": None,
-                                    "Error": "",
-                                    "Qualified Stats": []
-                                }
-
-                            if stat_choice == "Fantasy Points":
-                                streak_data = get_fantasy_streaks_for_line(
-                                    player_name=row.player_name_starter,
-                                    line=float(row.line),
-                                    book_name=book_title,
-                                    role="Hitter"
-                                )
-                            else:
-                                streak_data = get_standard_streaks_for_line(
-                                    player_name=row.player_name_starter,
-                                    stat_choice=stat_choice,
-                                    line=float(row.line)
-                                )
-
-                            if streak_data and streak_data.get("not_found"):
-                                player_groups[player_key]["Error"] = SPORTSBOOK_ERROR_TAG
-                                player_groups[player_key]["Player ID"] = None
-
-                            elif streak_data:
-                                player_groups[player_key]["Player ID"] = streak_data["player_id"]
-                                over_s = streak_data["over_current"]
-                                under_s = streak_data["under_current"]
-
-                                if over_s >= 3:
-                                    player_groups[player_key]["Qualified Stats"].append({
-                                        "Stat": stat_choice,
-                                        "Line": float(row.line),
-                                        "Direction": "Over",
-                                        "Current": over_s,
-                                        "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
-                                        "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
-                                    })
-
-                                if under_s >= 3:
-                                    player_groups[player_key]["Qualified Stats"].append({
-                                        "Stat": stat_choice,
-                                        "Line": float(row.line),
-                                        "Direction": "Under",
-                                        "Current": under_s,
-                                        "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
-                                        "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
-                                    })
-
-                            prog.progress(min(idx / total, 1.0))
-
-                        prog.empty()
-
-                        for _, pdata in player_groups.items():
-                            if pdata["Error"] or len(pdata["Qualified Stats"]) > 0:
-                                display_players.append(pdata)
-
-                        save_scan_results(bookmaker_key, TODAY, refreshed_at, display_players)
-
-                        if not display_players:
-                            st.info("No starting players had an over or under streak of 3+ against the current line.")
-
-            if display_players:
-                summary_rows = []
-                for pdata in display_players:
-                    if pdata["Error"]:
-                        summary_rows.append({
-                            "Player": pdata["Player"],
-                            "Team": pdata["Team"],
-                            "Matchup": pdata["Matchup"],
-                            "Book": pdata["Book"],
-                            "Qualified Stats Found": "N/A",
-                            "Error": pdata["Error"]
-                        })
-                    else:
-                        summary_rows.append({
-                            "Player": pdata["Player"],
-                            "Team": pdata["Team"],
-                            "Matchup": pdata["Matchup"],
-                            "Book": pdata["Book"],
-                            "Qualified Stats Found": len(pdata["Qualified Stats"]),
-                            "Error": ""
-                        })
-
-                summary_df = pd.DataFrame(summary_rows).sort_values(
-                    by=["Qualified Stats Found", "Player"],
-                    ascending=[False, True]
-                ).reset_index(drop=True)
-
-                st.markdown(f"## ✅ Players with at least one 3+ streak vs {book_title} lines")
-                st.dataframe(summary_df, use_container_width=True)
-
-                st.markdown("## Player Cards")
-                for pdata in display_players:
-                    if pdata["Error"]:
-                        render_not_found(pdata["Player"], pdata["Error"])
-                        st.markdown(
-                            f"<div style='margin-top:4px; color:#cccccc;'>{pdata['Team']} • {pdata['Matchup']} • {pdata['Book']}</div>",
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        player_id = pdata["Player ID"]
-                        base_df = load_hitter_data(player_id)
-
-                        if base_df.empty:
-                            st.warning(f"{pdata['Player']} found, but no game log data was returned.")
-                            continue
-
-                        render_scan_player_card(
-                            player_name=pdata["Player"],
-                            player_id=player_id,
-                            team=pdata["Team"],
-                            matchup=pdata["Matchup"],
-                            book_title=pdata["Book"],
-                            qualified_stats=pdata["Qualified Stats"],
-                            base_df=base_df
-                        )
+                            render_scan_player_card(
+                                player_name=pdata["Player"],
+                                player_id=player_id,
+                                team=pdata["Team"],
+                                matchup=pdata["Matchup"],
+                                book_title=pdata["Book"],
+                                qualified_stats=pdata["Qualified Stats"],
+                                base_df=base_df
+                            )
 
 # =========================================================
 # TAB 4 - FANTASY SCORE ANALYZER
