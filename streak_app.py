@@ -5,6 +5,7 @@ import altair as alt
 from datetime import date, datetime
 from pybaseball import playerid_lookup
 import requests
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
 # =========================================================
@@ -13,23 +14,11 @@ from concurrent.futures import ThreadPoolExecutor
 st.set_page_config(layout="wide")
 st.title("🔥 MLB Streak + Regression Analyzer")
 
-
 def get_odds_api_key():
     try:
-        if "ODDS_API_KEY" in st.secrets:
-            return st.secrets["ODDS_API_KEY"]
+        return st.secrets["ODDS_API_KEY"]
     except Exception:
-        pass
-
-    try:
-        odds_block = st.secrets.get("odds_api", {})
-        if isinstance(odds_block, dict) and odds_block.get("api_key"):
-            return odds_block["api_key"]
-    except Exception:
-        pass
-
-    return None
-
+        return ""
 
 ODDS_API_KEY = get_odds_api_key()
 TODAY = date.today().strftime("%Y-%m-%d")
@@ -116,6 +105,28 @@ FANTASY_SCORING = {
 
 SPORTSBOOK_ERROR_TAG = "Sorry bro, look on the app"
 MLB_LOOKUP_ERROR_TAG = "Player not found in MLB lookup"
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+if "daily_scan_active_book" not in st.session_state:
+    st.session_state["daily_scan_active_book"] = None
+
+if "daily_scan_render_payload" not in st.session_state:
+    st.session_state["daily_scan_render_payload"] = {
+        "bookmaker_key": None,
+        "book_title": None,
+        "display_players": [],
+        "refreshed_at": None,
+        "saved_count": None,
+        "starters_found": 0,
+        "usage_headers": {},
+        "mode": None,
+        "source_txt": None,
+        "meta_txt": None,
+        "warnings": [],
+        "infos": [],
+    }
 
 # =========================================================
 # DATABASE
@@ -207,7 +218,14 @@ def normalize_name(name):
     if not name:
         return ""
     x = str(name).strip().lower()
-    x = x.replace(".", "").replace("’", "'").replace("`", "'")
+    x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii")
+    x = (
+        x.replace(".", "")
+        .replace(",", "")
+        .replace("’", "'")
+        .replace("`", "'")
+        .replace("-", " ")
+    )
     suffixes = [" jr", " sr", " ii", " iii", " iv", " v"]
     for s in suffixes:
         if x.endswith(s):
@@ -215,6 +233,44 @@ def normalize_name(name):
     x = " ".join(x.split())
     return x
 
+def opposite_direction(direction):
+    return "Under" if direction == "Over" else "Over"
+
+def compute_direction_hits(stat_series, line):
+    line_value = float(line)
+    over_hit = stat_series >= line_value
+    under_hit = stat_series <= line_value
+    return over_hit, under_hit
+
+def select_display_streak(requested_direction, over_current, under_current):
+    requested_current = over_current if requested_direction == "Over" else under_current
+    opposite_current = under_current if requested_direction == "Over" else over_current
+
+    if opposite_current > requested_current:
+        active_direction = opposite_direction(requested_direction)
+        current = opposite_current
+        signed_value = -current
+    else:
+        active_direction = requested_direction
+        current = requested_current
+        signed_value = current
+
+    return {
+        "current": int(current),
+        "signed_value": int(signed_value),
+        "signed_label": f"{signed_value:+d}",
+        "active_direction": active_direction,
+    }
+
+def prepare_display_game_stats(game_stats, display_direction):
+    out = game_stats.copy()
+    if display_direction == "Over":
+        out["cleared"] = out["over_hit"]
+    else:
+        out["cleared"] = out["under_hit"]
+    out, current, past = build_result_streaks(out)
+    label, prob = streak_rating(current, past)
+    return out, current, past, label, prob
 
 def get_player_id(name):
     try:
@@ -227,15 +283,13 @@ def get_player_id(name):
         if df.empty:
             return None
         return int(df.iloc[0]["key_mlbam"])
-    except Exception:
+    except:
         return None
-
 
 def get_headshot(player_id):
     if not player_id:
         return "https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/missing/headshot/67/current.png"
     return f"https://img.mlbstatic.com/mlb-photos/image/upload/v1/people/{int(player_id)}/headshot/67/current.png"
-
 
 def innings_string_to_float(ip_value):
     try:
@@ -252,9 +306,8 @@ def innings_string_to_float(ip_value):
         if frac == 2:
             return whole + (2 / 3)
         return float(whole)
-    except Exception:
+    except:
         return 0.0
-
 
 def streak_rating(current, past):
     if not past:
@@ -269,7 +322,6 @@ def streak_rating(current, past):
     elif prob < 0.65:
         return "⚪ Coin Flip ⚖️", prob
     return "🟢 Strong ✅", prob
-
 
 def build_result_streaks(game_stats):
     streak = 0
@@ -299,46 +351,6 @@ def build_result_streaks(game_stats):
         past.append(temp)
 
     return game_stats, current, past
-
-
-def clear_daily_scan_view(bookmaker_key=None):
-    targets = [bookmaker_key] if bookmaker_key else list(BOOKMAKER_MAP.values())
-    for key in targets:
-        st.session_state.pop(f"daily_scan_view_{key}", None)
-
-
-def save_daily_scan_view(bookmaker_key, payload):
-    st.session_state[f"daily_scan_view_{bookmaker_key}"] = payload
-
-
-def get_daily_scan_view(bookmaker_key):
-    return st.session_state.get(f"daily_scan_view_{bookmaker_key}")
-
-
-def reset_daily_scan_for_book_switch(new_bookmaker_key):
-    previous_book = st.session_state.get("daily_scan_active_bookmaker")
-    if previous_book != new_bookmaker_key:
-        st.session_state["daily_scan_active_bookmaker"] = new_bookmaker_key
-        st.session_state["daily_scan_last_action"] = None
-
-
-def clear_refreshable_caches():
-    try:
-        odds_get_today_events.clear()
-    except Exception:
-        pass
-    try:
-        get_today_games.clear()
-    except Exception:
-        pass
-    try:
-        get_game_boxscore.clear()
-    except Exception:
-        pass
-    try:
-        get_today_starting_lineups.clear()
-    except Exception:
-        pass
 
 # =========================================================
 # DATA LOADERS
@@ -385,7 +397,7 @@ def load_hitter_data(player_id):
                     "ab": int(stat.get("atBats", 0))
                 })
             return rows
-        except Exception:
+        except:
             return []
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -402,7 +414,6 @@ def load_hitter_data(player_id):
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["game_date"])
     return df.sort_values("game_date", ascending=False)
-
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def load_pitcher_data(player_id):
@@ -433,7 +444,7 @@ def load_pitcher_data(player_id):
                     "ip_display": ip_string,
                 })
             return rows
-        except Exception:
+        except:
             return []
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -468,7 +479,6 @@ def get_stat(row, stat_choice):
     key = stat_map.get(stat_choice, stat_choice.lower())
     return row.get(key, 0)
 
-
 def get_hitter_fantasy_score(row, book_name):
     s = FANTASY_SCORING[book_name]["Hitter"]
     return (
@@ -482,7 +492,6 @@ def get_hitter_fantasy_score(row, book_name):
         + row.get("hbp", 0) * s["hbp"]
         + row.get("stolen_bases", 0) * s["stolen_base"]
     )
-
 
 def get_pitcher_fantasy_score(row, book_name):
     s = FANTASY_SCORING[book_name]["Pitcher"]
@@ -502,7 +511,6 @@ def get_pitcher_fantasy_score(row, book_name):
         + row.get("earned_runs", 0) * s["earned_run"]
     )
 
-
 def compute_current_streak(series_bool):
     current = 0
     for v in series_bool:
@@ -511,7 +519,6 @@ def compute_current_streak(series_bool):
         else:
             break
     return current
-
 
 def build_top_streaks(game_stats):
     gs = game_stats.sort_values("game_date")
@@ -537,22 +544,26 @@ def build_top_streaks(game_stats):
 
     return sorted(streaks, key=lambda x: x[0], reverse=True)[:10]
 
-
 def build_standard_game_stats(df, stat_choice, line, direction):
     df = df.copy()
     df["stat"] = df.apply(lambda row: get_stat(row, stat_choice), axis=1)
     game_stats = df[["game_date", "stat", "ab"]].copy()
     game_stats = game_stats.sort_values("game_date", ascending=False)
 
-    if direction == "Over":
-        game_stats["cleared"] = game_stats["stat"] >= float(line)
-    else:
-        game_stats["cleared"] = game_stats["stat"] <= float(line)
+    over_hit, under_hit = compute_direction_hits(game_stats["stat"], line)
+    game_stats["over_hit"] = over_hit
+    game_stats["under_hit"] = under_hit
 
-    game_stats, current, past = build_result_streaks(game_stats)
-    label, prob = streak_rating(current, past)
-    return game_stats, current, past, label, prob
-
+    display_meta = select_display_streak(
+        requested_direction=direction,
+        over_current=compute_current_streak(game_stats["over_hit"].tolist()),
+        under_current=compute_current_streak(game_stats["under_hit"].tolist()),
+    )
+    game_stats, current, past, label, prob = prepare_display_game_stats(
+        game_stats,
+        display_meta["active_direction"]
+    )
+    return game_stats, current, past, label, prob, display_meta
 
 def build_fantasy_game_stats(df, line, direction, book_name, role):
     df = df.copy()
@@ -566,15 +577,20 @@ def build_fantasy_game_stats(df, line, direction, book_name, role):
 
     game_stats = game_stats.sort_values("game_date", ascending=False)
 
-    if direction == "Over":
-        game_stats["cleared"] = game_stats["stat"] >= float(line)
-    else:
-        game_stats["cleared"] = game_stats["stat"] <= float(line)
+    over_hit, under_hit = compute_direction_hits(game_stats["stat"], line)
+    game_stats["over_hit"] = over_hit
+    game_stats["under_hit"] = under_hit
 
-    game_stats, current, past = build_result_streaks(game_stats)
-    label, prob = streak_rating(current, past)
-    return game_stats, current, past, label, prob
-
+    display_meta = select_display_streak(
+        requested_direction=direction,
+        over_current=compute_current_streak(game_stats["over_hit"].tolist()),
+        under_current=compute_current_streak(game_stats["under_hit"].tolist()),
+    )
+    game_stats, current, past, label, prob = prepare_display_game_stats(
+        game_stats,
+        display_meta["active_direction"]
+    )
+    return game_stats, current, past, label, prob, display_meta
 
 def get_standard_streaks_for_line(player_name, stat_choice, line):
     player_id = get_player_id(player_name)
@@ -592,8 +608,7 @@ def get_standard_streaks_for_line(player_name, stat_choice, line):
 
     gs = df.sort_values("game_date", ascending=False).copy()
     gs["stat"] = gs.apply(lambda row: get_stat(row, stat_choice), axis=1)
-    gs["over_hit"] = gs["stat"] >= float(line)
-    gs["under_hit"] = gs["stat"] <= float(line)
+    gs["over_hit"], gs["under_hit"] = compute_direction_hits(gs["stat"], line)
 
     over_current = compute_current_streak(gs["over_hit"].tolist())
     under_current = compute_current_streak(gs["under_hit"].tolist())
@@ -607,7 +622,6 @@ def get_standard_streaks_for_line(player_name, stat_choice, line):
         "under_current": under_current,
         "game_stats": gs
     }
-
 
 def get_fantasy_streaks_for_line(player_name, line, book_name, role="Hitter"):
     player_id = get_player_id(player_name)
@@ -630,8 +644,7 @@ def get_fantasy_streaks_for_line(player_name, line, book_name, role="Hitter"):
     else:
         gs["stat"] = gs.apply(lambda row: get_hitter_fantasy_score(row, book_name), axis=1)
 
-    gs["over_hit"] = gs["stat"] >= float(line)
-    gs["under_hit"] = gs["stat"] <= float(line)
+    gs["over_hit"], gs["under_hit"] = compute_direction_hits(gs["stat"], line)
 
     over_current = compute_current_streak(gs["over_hit"].tolist())
     under_current = compute_current_streak(gs["under_hit"].tolist())
@@ -670,20 +683,23 @@ def process_player(player, stat_choice, line, direction):
             "no_data": True
         }
 
-    game_stats, current, past, label, prob = build_standard_game_stats(df, stat_choice, line, direction)
+    game_stats, current, past, label, prob, display_meta = build_standard_game_stats(df, stat_choice, line, direction)
 
     return {
         "player_id": player_id,
         "player_name": player,
         "game_stats": game_stats,
         "current": current,
+        "current_signed": display_meta["signed_value"],
+        "current_signed_label": display_meta["signed_label"],
+        "active_direction": display_meta["active_direction"],
+        "requested_direction": direction,
         "label": label,
         "prob": prob,
         "past": past,
         "not_found": False,
         "no_data": False
     }
-
 
 def process_fantasy_player(player, line, direction, book_name, role):
     player_id = get_player_id(player)
@@ -705,13 +721,17 @@ def process_fantasy_player(player, line, direction, book_name, role):
             "no_data": True
         }
 
-    game_stats, current, past, label, prob = build_fantasy_game_stats(df, line, direction, book_name, role)
+    game_stats, current, past, label, prob, display_meta = build_fantasy_game_stats(df, line, direction, book_name, role)
 
     return {
         "player_id": player_id,
         "player_name": player,
         "game_stats": game_stats,
         "current": current,
+        "current_signed": display_meta["signed_value"],
+        "current_signed_label": display_meta["signed_label"],
+        "active_direction": display_meta["active_direction"],
+        "requested_direction": direction,
         "label": label,
         "prob": prob,
         "past": past,
@@ -749,7 +769,6 @@ def render_not_found(player, error_tag):
             unsafe_allow_html=True
         )
 
-
 def render_manual_player(player, r, line, direction):
     if r.get("not_found"):
         render_not_found(player, r.get("error_tag", MLB_LOOKUP_ERROR_TAG))
@@ -760,7 +779,12 @@ def render_manual_player(player, r, line, direction):
         return
 
     img = get_headshot(r["player_id"])
-    streak_color = "green" if r["current"] >= 3 else "white"
+    signed_streak = r.get("current_signed", r["current"])
+    signed_label = r.get("current_signed_label", f"{signed_streak:+d}")
+    streak_color = "green" if abs(signed_streak) >= 3 else "white"
+    direction_note = ""
+    if r.get("active_direction") and r.get("requested_direction") and r["active_direction"] != r["requested_direction"]:
+        direction_note = f" ({r['active_direction']})"
 
     col1, col2 = st.columns([1, 6])
     with col1:
@@ -771,14 +795,14 @@ def render_manual_player(player, r, line, direction):
         )
     with col2:
         st.markdown(
-            f"### {player} — <span style='color:{streak_color}'>{r['current']}</span> — {r['label']}",
+            f"### {player} — <span style='color:{streak_color}'>✅{signed_label}</span>{direction_note} — {r['label']}",
             unsafe_allow_html=True
         )
 
     with st.expander("View Details"):
-        current_color = "green" if r["current"] >= 3 else "white"
+        current_color = "green" if abs(signed_streak) >= 3 else "white"
         st.markdown(
-            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>{r['current']}</span>)",
+            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
             unsafe_allow_html=True
         )
 
@@ -824,7 +848,6 @@ def render_manual_player(player, r, line, direction):
 
         st.altair_chart(bar + zero_text, use_container_width=True)
 
-
 def render_fantasy_player(player, r, line, direction):
     if r.get("not_found"):
         render_not_found(player, r.get("error_tag", MLB_LOOKUP_ERROR_TAG))
@@ -835,7 +858,12 @@ def render_fantasy_player(player, r, line, direction):
         return
 
     img = get_headshot(r["player_id"])
-    streak_color = "green" if r["current"] >= 3 else "white"
+    signed_streak = r.get("current_signed", r["current"])
+    signed_label = r.get("current_signed_label", f"{signed_streak:+d}")
+    streak_color = "green" if abs(signed_streak) >= 3 else "white"
+    direction_note = ""
+    if r.get("active_direction") and r.get("requested_direction") and r["active_direction"] != r["requested_direction"]:
+        direction_note = f" ({r['active_direction']})"
 
     col1, col2 = st.columns([1, 6])
     with col1:
@@ -846,7 +874,7 @@ def render_fantasy_player(player, r, line, direction):
         )
     with col2:
         st.markdown(
-            f"### {player} — <span style='color:{streak_color}'>{r['current']}</span> — {r['label']}",
+            f"### {player} — <span style='color:{streak_color}'>✅{signed_label}</span>{direction_note} — {r['label']}",
             unsafe_allow_html=True
         )
         st.markdown(
@@ -855,9 +883,9 @@ def render_fantasy_player(player, r, line, direction):
         )
 
     with st.expander("View Details"):
-        current_color = "green" if r["current"] >= 3 else "white"
+        current_color = "green" if abs(signed_streak) >= 3 else "white"
         st.markdown(
-            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>{r['current']}</span>)",
+            f"### 🔥 Top 10 Streaks (Current: <span style='color:{current_color}'>✅{signed_label}</span>{direction_note})",
             unsafe_allow_html=True
         )
 
@@ -906,7 +934,6 @@ def render_fantasy_player(player, r, line, direction):
 
         st.altair_chart(bar + zero_text, use_container_width=True)
 
-
 def build_scan_display_game_log(base_df, qualified_stats):
     base_sorted = base_df.sort_values("game_date", ascending=False).reset_index(drop=True)
     display = pd.DataFrame({"game_date": base_sorted["game_date"]})
@@ -952,7 +979,6 @@ def build_scan_display_game_log(base_df, qualified_stats):
 
     return display
 
-
 def build_scan_top_streaks(base_df, q):
     df = base_df.copy()
 
@@ -978,7 +1004,6 @@ def build_scan_top_streaks(base_df, q):
             break
 
     return df, current, build_top_streaks(df)
-
 
 def render_scan_player_card(player_name, player_id, team, matchup, book_title, qualified_stats, base_df):
     img = get_headshot(player_id)
@@ -1079,18 +1104,16 @@ def get_today_games():
         if not games:
             return []
         return games[0].get("games", [])
-    except Exception:
+    except:
         return []
-
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
 def get_game_boxscore(game_pk):
     url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
     try:
         return requests.get(url, timeout=15).json()
-    except Exception:
+    except:
         return {}
-
 
 def parse_lineup_players(boxscore_json):
     starters = []
@@ -1122,8 +1145,11 @@ def parse_lineup_players(boxscore_json):
 
     return starters
 
+def get_today_starting_lineups(force_refresh=False):
+    if force_refresh:
+        get_today_games.clear()
+        get_game_boxscore.clear()
 
-def get_today_starting_lineups():
     games = get_today_games()
     all_starters = []
 
@@ -1162,7 +1188,6 @@ def get_cached_props(bookmaker_key, scan_date):
     """
     return pd.read_sql_query(q, conn, params=(scan_date, bookmaker_key))
 
-
 def get_cache_meta(bookmaker_key, scan_date):
     cursor.execute("""
         SELECT refreshed_at FROM props_cache_meta
@@ -1171,12 +1196,10 @@ def get_cache_meta(bookmaker_key, scan_date):
     row = cursor.fetchone()
     return row[0] if row else None
 
-
 def clear_props_cache(bookmaker_key, scan_date):
     cursor.execute("DELETE FROM props_cache WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM props_cache_meta WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     conn.commit()
-
 
 def save_props_cache(bookmaker_key, scan_date, props_rows):
     clear_props_cache(bookmaker_key, scan_date)
@@ -1205,15 +1228,11 @@ def save_props_cache(bookmaker_key, scan_date, props_rows):
 
     conn.commit()
 
-
 @st.cache_data(show_spinner=False, ttl=60 * 5)
-def odds_get_today_events():
-    if not ODDS_API_KEY:
-        return [], {}
-
+def odds_get_today_events(api_key):
     url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
     params = {
-        "apiKey": ODDS_API_KEY,
+        "apiKey": api_key,
         "regions": "us_dfs",
         "markets": "h2h",
         "oddsFormat": "american",
@@ -1228,9 +1247,8 @@ def odds_get_today_events():
             "x-requests-last": r.headers.get("x-requests-last", "")
         }
         return r.json(), headers
-    except Exception:
+    except:
         return [], {}
-
 
 def parse_event_prop_response(event_json, event_id):
     rows = []
@@ -1273,12 +1291,11 @@ def parse_event_prop_response(event_json, event_id):
             rows.extend(temp.values())
     return rows
 
-
 def fetch_props_from_odds_api(bookmaker_key):
     if not ODDS_API_KEY:
         return [], {}
 
-    events, usage_headers = odds_get_today_events()
+    events, usage_headers = odds_get_today_events(ODDS_API_KEY)
     if not events:
         return [], usage_headers
 
@@ -1310,17 +1327,15 @@ def fetch_props_from_odds_api(bookmaker_key):
                 "x-requests-last": r.headers.get("x-requests-last", last_headers.get("x-requests-last", "")),
             }
             all_rows.extend(parse_event_prop_response(r.json(), event_id))
-        except Exception:
+        except:
             continue
 
     return all_rows, last_headers
 
-
 def get_props_for_book(bookmaker_key, force_refresh=False):
     if force_refresh:
         clear_props_cache(bookmaker_key, TODAY)
-        clear_daily_scan_view(bookmaker_key)
-        clear_refreshable_caches()
+        odds_get_today_events.clear()
 
     cached = get_cached_props(bookmaker_key, TODAY)
     if not cached.empty and not force_refresh:
@@ -1334,18 +1349,15 @@ def get_props_for_book(bookmaker_key, force_refresh=False):
 
     return pd.DataFrame(), False, None, usage_headers
 
-
 def market_key_to_stat(market_key):
     reverse = {v: k for k, v in SUPPORTED_PROP_MARKETS.items()}
     return reverse.get(market_key)
-
 
 def clear_scan_results_cache(bookmaker_key, scan_date):
     cursor.execute("DELETE FROM scan_results_players WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM scan_results_stats WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     cursor.execute("DELETE FROM scan_results_meta WHERE scan_date = ? AND bookmaker_key = ?", (scan_date, bookmaker_key))
     conn.commit()
-
 
 def save_scan_results(bookmaker_key, scan_date, refreshed_at, display_players):
     clear_scan_results_cache(bookmaker_key, scan_date)
@@ -1392,7 +1404,6 @@ def save_scan_results(bookmaker_key, scan_date, refreshed_at, display_players):
     """, (scan_date, bookmaker_key, refreshed_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(display_players)))
 
     conn.commit()
-
 
 def get_saved_scan_results(bookmaker_key, scan_date):
     players_df = pd.read_sql_query("""
@@ -1446,6 +1457,22 @@ def get_saved_scan_results(bookmaker_key, scan_date):
     refreshed_at = meta_row[0] if meta_row else None
     result_count = int(meta_row[1]) if meta_row and meta_row[1] is not None else len(display_players)
     return display_players, refreshed_at, result_count
+
+def reset_daily_scan_render_payload():
+    st.session_state["daily_scan_render_payload"] = {
+        "bookmaker_key": None,
+        "book_title": None,
+        "display_players": [],
+        "refreshed_at": None,
+        "saved_count": None,
+        "starters_found": 0,
+        "usage_headers": {},
+        "mode": None,
+        "source_txt": None,
+        "meta_txt": None,
+        "warnings": [],
+        "infos": [],
+    }
 
 # =========================================================
 # PAGE LAYOUT
@@ -1524,8 +1551,8 @@ with tab2:
 
                     rows = []
                     for stat_name in ALL_STATS_SCAN:
-                        _, current_over, _, _, _ = build_standard_game_stats(df, stat_name, all_stat_line, "Over")
-                        _, current_under, _, _, _ = build_standard_game_stats(df, stat_name, all_stat_line, "Under")
+                        _, current_over, _, _, _, _ = build_standard_game_stats(df, stat_name, all_stat_line, "Over")
+                        _, current_under, _, _, _, _ = build_standard_game_stats(df, stat_name, all_stat_line, "Under")
                         rows.append({
                             "Stat": stat_name,
                             "Line": all_stat_line,
@@ -1554,15 +1581,20 @@ with tab3:
     if len(selected) > 1:
         st.error("Pick only one sportsbook at a time.")
     elif len(selected) == 0:
+        if st.session_state["daily_scan_active_book"] is not None:
+            st.session_state["daily_scan_active_book"] = None
+            reset_daily_scan_render_payload()
         st.info("Choose PrizePicks or Underdog.")
     else:
         book_title = selected[0]
         bookmaker_key = BOOKMAKER_MAP[book_title]
-        reset_daily_scan_for_book_switch(bookmaker_key)
+
+        if st.session_state["daily_scan_active_book"] != bookmaker_key:
+            st.session_state["daily_scan_active_book"] = bookmaker_key
+            reset_daily_scan_render_payload()
 
         if not ODDS_API_KEY:
-            st.error("Odds API key not found in Streamlit secrets. Add ODDS_API_KEY to your app secrets before running the daily props scan.")
-            st.code('ODDS_API_KEY = "your_key_here"')
+            st.error("Odds API key not found. Add ODDS_API_KEY to your Streamlit secrets.")
         else:
             col_a, col_b, col_c = st.columns(3)
             with col_a:
@@ -1572,48 +1604,66 @@ with tab3:
             with col_c:
                 refresh_scan = st.button("Refresh Saved Lines From Sportsbook", key="refresh_daily_scan")
 
-            display_state = get_daily_scan_view(bookmaker_key)
-
             if run_scan or show_last_scan or refresh_scan:
                 force_refresh = bool(refresh_scan)
                 cache_only = bool(show_last_scan)
-                display_players = []
-                usage_headers = {}
-                refreshed_at = None
-                starters_count = None
-                source_text = None
-                warning_text = None
-                info_text = None
+
+                payload = {
+                    "bookmaker_key": bookmaker_key,
+                    "book_title": book_title,
+                    "display_players": [],
+                    "refreshed_at": None,
+                    "saved_count": None,
+                    "starters_found": 0,
+                    "usage_headers": {},
+                    "mode": "saved" if cache_only else "scan",
+                    "source_txt": None,
+                    "meta_txt": None,
+                    "warnings": [],
+                    "infos": [],
+                }
 
                 if cache_only:
                     with st.spinner("Loading last saved scan..."):
-                        starters_df = get_today_starting_lineups()
+                        starters_df = get_today_starting_lineups(force_refresh=False)
                         display_players, refreshed_at, saved_count = get_saved_scan_results(bookmaker_key, TODAY)
 
-                    starters_count = len(starters_df)
-                    if refreshed_at and not display_players and saved_count == 0:
-                        info_text = "Last saved scan found no starting players with a 3+ streak against the current lines."
-                    elif not refreshed_at:
-                        warning_text = "No saved scan found for today yet. Run a fresh scan first."
+                    payload["display_players"] = display_players
+                    payload["refreshed_at"] = refreshed_at
+                    payload["saved_count"] = saved_count
+                    payload["starters_found"] = len(starters_df)
 
-                    source_text = f"Using last saved scan. Last saved update: {refreshed_at}" if refreshed_at else None
+                    if starters_df.empty:
+                        payload["warnings"].append("No starting lineups were found from MLB yet.")
+
+                    if refreshed_at:
+                        payload["infos"].append(f"Using last saved scan. Last saved update: {refreshed_at}")
+                    else:
+                        payload["warnings"].append("No saved scan found for today yet. Run a fresh scan first.")
+
+                    if refreshed_at and not display_players and saved_count == 0:
+                        payload["infos"].append("Last saved scan found no starting players with a 3+ streak against the current lines.")
 
                 else:
                     with st.spinner("Loading today's starters and prop lines..."):
-                        starters_df = get_today_starting_lineups()
+                        starters_df = get_today_starting_lineups(force_refresh=force_refresh)
                         props_df, from_cache, refreshed_at, usage_headers = get_props_for_book(
                             bookmaker_key,
                             force_refresh=force_refresh
                         )
 
-                    starters_count = len(starters_df)
+                    payload["refreshed_at"] = refreshed_at
+                    payload["usage_headers"] = usage_headers
+                    payload["starters_found"] = len(starters_df)
+
+                    if starters_df.empty:
+                        payload["warnings"].append("No starting lineups were found from MLB yet.")
 
                     if props_df.empty:
-                        warning_text = "No props came back from the sportsbook/API for today."
-                        save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
+                        payload["warnings"].append("No props came back from the sportsbook/API for today.")
                     else:
-                        source_origin = "saved cache" if from_cache else "fresh sportsbook request"
-                        source_text = f"Using {source_origin}. Last saved update: {refreshed_at}" if refreshed_at else f"Using {source_origin}."
+                        payload["source_txt"] = "saved cache" if from_cache else "fresh sportsbook request"
+                        payload["meta_txt"] = f"Last saved update: {refreshed_at}" if refreshed_at else "No saved timestamp yet"
 
                         props_df["normalized_name"] = props_df["player_name"].apply(normalize_name)
 
@@ -1628,7 +1678,7 @@ with tab3:
                             )
 
                         if merged.empty:
-                            warning_text = "No sportsbook props matched the currently posted starting lineups."
+                            payload["warnings"].append("No sportsbook props matched the currently posted starting lineups.")
                             save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
                         else:
                             merged = merged.drop_duplicates(subset=["normalized_name", "market_key", "line"]).copy()
@@ -1703,55 +1753,42 @@ with tab3:
 
                             prog.empty()
 
+                            display_players = []
                             for _, pdata in player_groups.items():
                                 if pdata["Error"] or len(pdata["Qualified Stats"]) > 0:
                                     display_players.append(pdata)
 
+                            payload["display_players"] = display_players
                             save_scan_results(bookmaker_key, TODAY, refreshed_at, display_players)
 
                             if not display_players:
-                                info_text = "No starting players had an over or under streak of 3+ against the current line."
+                                payload["infos"].append("No starting players had an over or under streak of 3+ against the current line.")
 
-                display_state = {
-                    "display_players": display_players,
-                    "usage_headers": usage_headers,
-                    "refreshed_at": refreshed_at,
-                    "starters_count": starters_count,
-                    "source_text": source_text,
-                    "warning_text": warning_text,
-                    "info_text": info_text,
-                    "book_title": book_title,
-                    "bookmaker_key": bookmaker_key,
-                }
-                save_daily_scan_view(bookmaker_key, display_state)
+                st.session_state["daily_scan_render_payload"] = payload
 
-            if display_state:
-                display_players = display_state.get("display_players", [])
-                usage_headers = display_state.get("usage_headers", {})
-                refreshed_at = display_state.get("refreshed_at")
-                starters_count = display_state.get("starters_count")
-                source_text = display_state.get("source_text")
-                warning_text = display_state.get("warning_text")
-                info_text = display_state.get("info_text")
+            payload = st.session_state["daily_scan_render_payload"]
 
-                if starters_count is not None:
-                    if starters_count == 0:
-                        st.warning("No starting lineups were found from MLB yet.")
-                    else:
-                        st.write(f"Starting lineup players found: **{starters_count}**")
+            if payload.get("bookmaker_key") == bookmaker_key:
+                if payload["starters_found"] > 0:
+                    st.write(f"Starting lineup players found: **{payload['starters_found']}**")
 
+                usage_headers = payload.get("usage_headers", {})
                 if usage_headers:
                     used = usage_headers.get("x-requests-used", "")
                     remaining = usage_headers.get("x-requests-remaining", "")
                     last = usage_headers.get("x-requests-last", "")
                     st.caption(f"Odds API usage — Used: {used} | Remaining: {remaining} | Last request cost: {last}")
 
-                if source_text:
-                    st.caption(source_text)
-                if warning_text:
-                    st.warning(warning_text)
-                if info_text:
-                    st.info(info_text)
+                if payload.get("source_txt"):
+                    st.caption(f"Using {payload['source_txt']}. {payload.get('meta_txt', '')}")
+
+                for msg in payload.get("warnings", []):
+                    st.warning(msg)
+
+                for msg in payload.get("infos", []):
+                    st.info(msg)
+
+                display_players = payload.get("display_players", [])
 
                 if display_players:
                     summary_rows = []
