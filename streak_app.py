@@ -1,3 +1,4 @@
+
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -106,6 +107,34 @@ FANTASY_SCORING = {
 SPORTSBOOK_ERROR_TAG = "Sorry bro, look on the app"
 MLB_LOOKUP_ERROR_TAG = "Player not found in MLB lookup"
 
+NAME_ALIASES = {
+    "mike trout": "michael trout",
+    "mike yastrzemski": "michael yastrzemski",
+    "mike soroka": "michael soroka",
+    "mike minor": "michael minor",
+    "mike clevinger": "michael clevinger",
+    "mike moustakas": "michael moustakas",
+    "mike taimain": "michael taimain",
+    "nick martini": "nicholas martini",
+    "nick gonzales": "nicholas gonzales",
+    "nick lodolo": "nicholas lodolo",
+    "nick pivetta": "nicholas pivetta",
+    "tony kemp": "anthony kemp",
+    "tony gonsolin": "anthony gonsolin",
+    "tony santillan": "antonio santillan",
+    "matt chapman": "matthew chapman",
+    "matt olson": "matthew olson",
+    "matt vierling": "matthew vierling",
+    "matt wallner": "matthew wallner",
+    "matt mervis": "matthew mervis",
+    "jd martinez": "julio daniel martinez",
+    "cj abrams": "c j abrams",
+    "dj lemahieu": "d j lemahieu",
+    "jj bleday": "j j bleday",
+    "kike hernandez": "enrique hernandez",
+}
+REVERSE_NAME_ALIASES = {v: k for k, v in NAME_ALIASES.items()}
+
 # =========================================================
 # SESSION STATE
 # =========================================================
@@ -126,6 +155,7 @@ if "daily_scan_render_payload" not in st.session_state:
         "meta_txt": None,
         "warnings": [],
         "infos": [],
+        "debug": {},
     }
 
 # =========================================================
@@ -231,7 +261,135 @@ def normalize_name(name):
         if x.endswith(s):
             x = x[:-len(s)]
     x = " ".join(x.split())
+    x = NAME_ALIASES.get(x, x)
     return x
+
+def expand_name_variants(name):
+    base = normalize_name(name)
+    variants = {base}
+    if not base:
+        return variants
+    if base in REVERSE_NAME_ALIASES:
+        variants.add(normalize_name(REVERSE_NAME_ALIASES[base]))
+    if base in NAME_ALIASES:
+        variants.add(normalize_name(NAME_ALIASES[base]))
+    parts = base.split()
+    if len(parts) >= 2:
+        first = parts[0]
+        last = parts[-1]
+        if len(first) == 1:
+            variants.add(f"{first} {last}")
+        variants.add(f"{last}")
+    return {v for v in variants if v}
+
+def get_last_name_norm(name):
+    norm = normalize_name(name)
+    if not norm:
+        return ""
+    return norm.split()[-1]
+
+def build_starter_match_lookup(starters_df):
+    exact_lookup = {}
+    last_name_lookup = {}
+
+    for row in starters_df.itertuples(index=False):
+        row_dict = {
+            "player_name": row.player_name,
+            "normalized_name": row.normalized_name,
+            "team": row.team,
+            "position": row.position,
+            "matchup": row.matchup,
+            "batting_order": row.batting_order,
+            "game_pk": row.game_pk,
+        }
+        for variant in expand_name_variants(row.player_name):
+            exact_lookup.setdefault(variant, row_dict)
+
+        last_norm = get_last_name_norm(row.player_name)
+        if last_norm:
+            last_name_lookup.setdefault(last_norm, []).append(row_dict)
+
+    unique_last_lookup = {k: v[0] for k, v in last_name_lookup.items() if len(v) == 1}
+    return exact_lookup, unique_last_lookup
+
+def match_props_to_starters(props_df, starters_df):
+    if props_df.empty or starters_df.empty:
+        return pd.DataFrame(), {
+            "props_rows": len(props_df),
+            "matched_rows": 0,
+            "unique_prop_players": 0,
+            "unique_matched_players": 0,
+            "fallback_alias_matches": 0,
+            "fallback_last_name_matches": 0,
+            "unmatched_prop_players": 0,
+        }
+
+    exact_lookup, unique_last_lookup = build_starter_match_lookup(starters_df)
+    matched_rows = []
+    alias_match_count = 0
+    last_name_match_count = 0
+    unmatched_names = set()
+
+    deduped_props = props_df.drop_duplicates(subset=["player_name", "market_key", "line", "event_id"]).copy()
+
+    for row in deduped_props.itertuples(index=False):
+        prop_name = row.player_name
+        prop_norm = normalize_name(prop_name)
+        starter_row = None
+        matched_via = None
+
+        for variant in expand_name_variants(prop_name):
+            if variant in exact_lookup:
+                starter_row = exact_lookup[variant]
+                matched_via = "exact" if variant == prop_norm else "alias"
+                break
+
+        if starter_row is None:
+            last_norm = get_last_name_norm(prop_name)
+            if last_norm and last_norm in unique_last_lookup:
+                starter_row = unique_last_lookup[last_norm]
+                matched_via = "last_name"
+
+        if starter_row is None:
+            unmatched_names.add(prop_name)
+            continue
+
+        if matched_via == "alias":
+            alias_match_count += 1
+        elif matched_via == "last_name":
+            last_name_match_count += 1
+
+        matched_rows.append({
+            "event_id": row.event_id,
+            "market_key": row.market_key,
+            "player_name_prop": prop_name,
+            "player_name_starter": starter_row["player_name"],
+            "normalized_name": starter_row["normalized_name"],
+            "team": starter_row["team"],
+            "position": starter_row["position"],
+            "matchup": starter_row["matchup"],
+            "batting_order": starter_row["batting_order"],
+            "line": float(row.line),
+            "over_price": row.over_price,
+            "under_price": row.under_price,
+            "last_update": row.last_update,
+            "match_method": matched_via,
+        })
+
+    matched_df = pd.DataFrame(matched_rows)
+    if not matched_df.empty:
+        matched_df = matched_df.drop_duplicates(subset=["normalized_name", "market_key", "line"])
+
+    debug = {
+        "props_rows": len(props_df),
+        "matched_rows": len(matched_df),
+        "unique_prop_players": int(props_df["player_name"].nunique()) if not props_df.empty else 0,
+        "unique_matched_players": int(matched_df["normalized_name"].nunique()) if not matched_df.empty else 0,
+        "fallback_alias_matches": alias_match_count,
+        "fallback_last_name_matches": last_name_match_count,
+        "unmatched_prop_players": len(unmatched_names),
+    }
+    return matched_df, debug
 
 def opposite_direction(direction):
     return "Under" if direction == "Over" else "Over"
@@ -274,16 +432,58 @@ def prepare_display_game_stats(game_stats, display_direction):
 
 def get_player_id(name):
     try:
-        parts = name.split(" ")
+        parts = str(name).strip().split(" ")
         if len(parts) < 2:
             return None
         first = parts[0]
         last = parts[-1]
+        candidates = []
+
         df = playerid_lookup(last, first)
-        if df.empty:
+        if not df.empty:
+            candidates.append(df)
+
+        norm = normalize_name(name)
+        alias_variants = expand_name_variants(name)
+        for variant in alias_variants:
+            vp = variant.split()
+            if len(vp) < 2:
+                continue
+            vfirst = vp[0]
+            vlast = vp[-1]
+            if vfirst == first and vlast == last:
+                continue
+            try:
+                vdf = playerid_lookup(vlast, vfirst)
+                if not vdf.empty:
+                    candidates.append(vdf)
+            except Exception:
+                pass
+
+        if not candidates:
             return None
-        return int(df.iloc[0]["key_mlbam"])
-    except:
+
+        combo = pd.concat(candidates, ignore_index=True).drop_duplicates()
+        if "mlb_played_last" in combo.columns:
+            combo = combo.sort_values("mlb_played_last", ascending=False)
+
+        if "name_first" in combo.columns and "name_last" in combo.columns:
+            combo["full_norm"] = (
+                combo["name_first"].fillna("").astype(str).str.strip() + " " +
+                combo["name_last"].fillna("").astype(str).str.strip()
+            ).apply(normalize_name)
+
+            exact = combo[combo["full_norm"] == norm]
+            if not exact.empty:
+                return int(exact.iloc[0]["key_mlbam"])
+
+            for variant in alias_variants:
+                exact = combo[combo["full_norm"] == normalize_name(variant)]
+                if not exact.empty:
+                    return int(exact.iloc[0]["key_mlbam"])
+
+        return int(combo.iloc[0]["key_mlbam"])
+    except Exception:
         return None
 
 def get_headshot(player_id):
@@ -987,7 +1187,7 @@ def build_scan_top_streaks(base_df, q):
     else:
         df["stat"] = df.apply(lambda row: get_stat(row, q["Stat"]), axis=1)
 
-    keep_cols = ["game_date", "stat", "ab"]
+    keep_cols = ["game_date", "stat", "ab"] if "ab" in df.columns else ["game_date", "stat"]
     df = df[keep_cols].copy()
     df = df.sort_values("game_date", ascending=False)
 
@@ -1262,7 +1462,7 @@ def parse_event_prop_response(event_json, event_id):
             temp = {}
 
             for out in outcomes:
-                player_name = out.get("description") or out.get("player") or out.get("name")
+                player_name = out.get("description") or out.get("player") or out.get("player_name") or out.get("participant") or out.get("name")
                 side = str(out.get("name", "")).strip().lower()
                 point = out.get("point")
 
@@ -1472,6 +1672,7 @@ def reset_daily_scan_render_payload():
         "meta_txt": None,
         "warnings": [],
         "infos": [],
+        "debug": {},
     }
 
 # =========================================================
@@ -1621,6 +1822,7 @@ with tab3:
                     "meta_txt": None,
                     "warnings": [],
                     "infos": [],
+                    "debug": {},
                 }
 
                 if cache_only:
@@ -1666,23 +1868,13 @@ with tab3:
                         payload["meta_txt"] = f"Last saved update: {refreshed_at}" if refreshed_at else "No saved timestamp yet"
 
                         props_df["normalized_name"] = props_df["player_name"].apply(normalize_name)
-
-                        if starters_df.empty:
-                            merged = props_df.iloc[0:0].copy()
-                        else:
-                            merged = props_df.merge(
-                                starters_df[["player_name", "normalized_name", "team", "position", "matchup"]],
-                                on="normalized_name",
-                                how="inner",
-                                suffixes=("_prop", "_starter")
-                            )
+                        merged, merge_debug = match_props_to_starters(props_df, starters_df)
+                        payload["debug"] = merge_debug
 
                         if merged.empty:
                             payload["warnings"].append("No sportsbook props matched the currently posted starting lineups.")
                             save_scan_results(bookmaker_key, TODAY, refreshed_at, [])
                         else:
-                            merged = merged.drop_duplicates(subset=["normalized_name", "market_key", "line"]).copy()
-
                             player_groups = {}
                             prog = st.progress(0)
                             total = len(merged)
@@ -1706,6 +1898,7 @@ with tab3:
                                         "Qualified Stats": []
                                     }
 
+                                # Use the sportsbook's posted line, but always test BOTH over and under.
                                 if stat_choice == "Fantasy Points":
                                     streak_data = get_fantasy_streaks_for_line(
                                         player_name=row.player_name_starter,
@@ -1726,28 +1919,40 @@ with tab3:
 
                                 elif streak_data:
                                     player_groups[player_key]["Player ID"] = streak_data["player_id"]
-                                    over_s = streak_data["over_current"]
-                                    under_s = streak_data["under_current"]
+                                    over_s = int(streak_data["over_current"])
+                                    under_s = int(streak_data["under_current"])
+
+                                    existing_keys = {
+                                        (q["Stat"], float(q["Line"]), q["Direction"], q["Mode"], q.get("Fantasy Book"))
+                                        for q in player_groups[player_key]["Qualified Stats"]
+                                    }
 
                                     if over_s >= 3:
-                                        player_groups[player_key]["Qualified Stats"].append({
+                                        qrow = {
                                             "Stat": stat_choice,
                                             "Line": float(row.line),
                                             "Direction": "Over",
                                             "Current": over_s,
                                             "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
                                             "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
-                                        })
+                                        }
+                                        key = (qrow["Stat"], qrow["Line"], qrow["Direction"], qrow["Mode"], qrow.get("Fantasy Book"))
+                                        if key not in existing_keys:
+                                            player_groups[player_key]["Qualified Stats"].append(qrow)
+                                            existing_keys.add(key)
 
                                     if under_s >= 3:
-                                        player_groups[player_key]["Qualified Stats"].append({
+                                        qrow = {
                                             "Stat": stat_choice,
                                             "Line": float(row.line),
                                             "Direction": "Under",
                                             "Current": under_s,
                                             "Mode": "fantasy" if stat_choice == "Fantasy Points" else "standard",
                                             "Fantasy Book": book_title if stat_choice == "Fantasy Points" else None,
-                                        })
+                                        }
+                                        key = (qrow["Stat"], qrow["Line"], qrow["Direction"], qrow["Mode"], qrow.get("Fantasy Book"))
+                                        if key not in existing_keys:
+                                            player_groups[player_key]["Qualified Stats"].append(qrow)
 
                                 prog.progress(min(idx / total, 1.0))
 
@@ -1756,13 +1961,26 @@ with tab3:
                             display_players = []
                             for _, pdata in player_groups.items():
                                 if pdata["Error"] or len(pdata["Qualified Stats"]) > 0:
+                                    pdata["Qualified Stats"] = sorted(
+                                        pdata["Qualified Stats"],
+                                        key=lambda q: (q["Current"], q["Stat"], q["Direction"]),
+                                        reverse=True
+                                    )
                                     display_players.append(pdata)
 
-                            payload["display_players"] = display_players
-                            save_scan_results(bookmaker_key, TODAY, refreshed_at, display_players)
+                            payload["display_players"] = sorted(
+                                display_players,
+                                key=lambda p: (
+                                    0 if p["Error"] else 1,
+                                    max([q["Current"] for q in p["Qualified Stats"]], default=0),
+                                    p["Player"]
+                                ),
+                                reverse=True
+                            )
+                            save_scan_results(bookmaker_key, TODAY, refreshed_at, payload["display_players"])
 
-                            if not display_players:
-                                payload["infos"].append("No starting players had an over or under streak of 3+ against the current line.")
+                            if not payload["display_players"]:
+                                payload["infos"].append("No starting players had an over or under streak of 3+ against the current sportsbook-posted line.")
 
                 st.session_state["daily_scan_render_payload"] = payload
 
@@ -1781,6 +1999,19 @@ with tab3:
 
                 if payload.get("source_txt"):
                     st.caption(f"Using {payload['source_txt']}. {payload.get('meta_txt', '')}")
+
+                debug = payload.get("debug", {})
+                if debug:
+                    st.caption(
+                        "Match debug — "
+                        f"Prop rows: {debug.get('props_rows', 0)} | "
+                        f"Matched rows: {debug.get('matched_rows', 0)} | "
+                        f"Unique prop players: {debug.get('unique_prop_players', 0)} | "
+                        f"Unique matched players: {debug.get('unique_matched_players', 0)} | "
+                        f"Alias fallback matches: {debug.get('fallback_alias_matches', 0)} | "
+                        f"Last-name fallback matches: {debug.get('fallback_last_name_matches', 0)} | "
+                        f"Unmatched prop players: {debug.get('unmatched_prop_players', 0)}"
+                    )
 
                 for msg in payload.get("warnings", []):
                     st.warning(msg)
